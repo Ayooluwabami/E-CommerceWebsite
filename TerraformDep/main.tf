@@ -16,12 +16,16 @@ terraform {
         time = {
             source  = "hashicorp/time"
             version = "~> 0.9"
-            }
+        }
+        tls = {
+            source  = "hashicorp/tls"
+            version = "~> 4.0"
+        }
     }
     backend "s3" {
-        bucket         = "ecommerce-terraform-state-202951752028"
-        key            = "terraform.tfstate"
-        region         = "eu-west-2"
+        bucket       = "ecommerce-terraform-state-202951752028"
+        key          = "terraform.tfstate"
+        region       = "eu-west-2"
         use_lockfile = true
     }
 }
@@ -70,7 +74,7 @@ resource "aws_subnet" "public" {
     availability_zone       = element(data.aws_availability_zones.available.names, count.index)
     map_public_ip_on_launch = true
     tags = {
-        Name = "eks-public-${count.index}"
+        Name                     = "eks-public-${count.index}"
         "kubernetes.io/role/elb" = "1"
     }
 }
@@ -111,6 +115,19 @@ resource "aws_eks_cluster" "eks_cluster" {
     ]
 }
 
+# OIDC provider for EKS (required for IAM Roles for Service Accounts)
+data "tls_certificate" "eks" {
+    url = aws_eks_cluster.eks_cluster.identity[0].oidc[0].issuer
+}
+
+resource "aws_iam_openid_connect_provider" "eks" {
+    client_id_list  = ["sts.amazonaws.com"]
+    thumbprint_list = [data.tls_certificate.eks.certificates[0].sha1_fingerprint]
+    url             = aws_eks_cluster.eks_cluster.identity[0].oidc[0].issuer
+
+    depends_on = [aws_eks_cluster.eks_cluster]
+}
+
 resource "aws_eks_node_group" "node_group" {
     cluster_name    = aws_eks_cluster.eks_cluster.name
     node_group_name = "eks-nodes"
@@ -135,8 +152,8 @@ resource "aws_iam_role" "eks_cluster" {
         Version = "2012-10-17"
         Statement = [
             {
-                Action = "sts:AssumeRole"
-                Effect = "Allow"
+                Action    = "sts:AssumeRole"
+                Effect    = "Allow"
                 Principal = {
                     Service = "eks.amazonaws.com"
                 }
@@ -156,8 +173,8 @@ resource "aws_iam_role" "eks_nodes" {
         Version = "2012-10-17"
         Statement = [
             {
-                Action = "sts:AssumeRole"
-                Effect = "Allow"
+                Action    = "sts:AssumeRole"
+                Effect    = "Allow"
                 Principal = {
                     Service = "ec2.amazonaws.com"
                 }
@@ -183,8 +200,8 @@ resource "aws_iam_role_policy_attachment" "ecr_read_only" {
 
 # Security groups
 resource "aws_security_group" "eks_nodes_sg" {
-    name        = "eks-nodes-sg"
-    vpc_id      = aws_vpc.main.id
+    name   = "eks-nodes-sg"
+    vpc_id = aws_vpc.main.id
     ingress {
         from_port       = 80
         to_port         = 80
@@ -203,8 +220,8 @@ resource "aws_security_group" "eks_nodes_sg" {
 }
 
 resource "aws_security_group" "alb_sg" {
-    name        = "eks-alb-sg"
-    vpc_id      = aws_vpc.main.id
+    name   = "eks-alb-sg"
+    vpc_id = aws_vpc.main.id
     ingress {
         from_port   = 80
         to_port     = 80
@@ -257,6 +274,12 @@ resource "kubernetes_deployment" "app" {
     ]
 }
 
+# Wait for LB controller webhook to be fully ready
+resource "time_sleep" "wait_for_lb_controller" {
+    depends_on      = [helm_release.load_balancer_controller]
+    create_duration = "60s"
+}
+
 # Kubernetes service with LoadBalancer
 resource "kubernetes_service" "app_service" {
     metadata {
@@ -274,18 +297,12 @@ resource "kubernetes_service" "app_service" {
         type = var.service_type
     }
     depends_on = [
-        kubernetes_deployment.app
+        kubernetes_deployment.app,
+        time_sleep.wait_for_lb_controller
     ]
 }
-resource "time_sleep" "wait_for_lb_controller" {
-  depends_on      = [helm_release.load_balancer_controller]
-  create_duration = "60s"
-}
 
-resource "kubernetes_service" "app_service" {
-  depends_on = [time_sleep.wait_for_lb_controller]
-}
-# AWS Load Balancer Controller
+# AWS Load Balancer Controller IAM
 resource "aws_iam_policy" "load_balancer_controller" {
     name        = "AWSLoadBalancerControllerIAMPolicy"
     description = "Policy for AWS Load Balancer Controller"
@@ -300,12 +317,12 @@ resource "aws_iam_role" "load_balancer_controller" {
             {
                 Effect = "Allow"
                 Principal = {
-                    Federated = "arn:aws:iam::${var.aws_account_id}:oidc-provider/oidc.eks.${var.region}.amazonaws.com/id/${replace(aws_eks_cluster.eks_cluster.identity[0].oidc[0].issuer, "https://", "")}"
+                    Federated = aws_iam_openid_connect_provider.eks.arn
                 }
                 Action = "sts:AssumeRoleWithWebIdentity"
                 Condition = {
                     StringEquals = {
-                        "oidc.eks.${var.region}.amazonaws.com/id/${replace(aws_eks_cluster.eks_cluster.identity[0].oidc[0].issuer, "https://", "")}:sub" = "system:serviceaccount:kube-system:aws-load-balancer-controller"
+                        "${replace(aws_iam_openid_connect_provider.eks.url, "https://", "")}:sub" = "system:serviceaccount:kube-system:aws-load-balancer-controller"
                     }
                 }
             }
@@ -333,7 +350,7 @@ resource "helm_release" "load_balancer_controller" {
     repository = "https://aws.github.io/eks-charts"
     chart      = "aws-load-balancer-controller"
     namespace  = "kube-system"
-    timeout    = 600  # Increased timeout to 10 minutes
+    timeout    = 600
     wait       = true
     set {
         name  = "clusterName"
@@ -361,5 +378,5 @@ resource "helm_release" "load_balancer_controller" {
     ]
 }
 
-# Data source for availability zones
+# Data sources
 data "aws_availability_zones" "available" {}
